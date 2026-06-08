@@ -1,0 +1,558 @@
+================================================================================
+  AGENTIC AI INTELLIGENT LOAN APPROVAL SYSTEM — COMPLETE FLOW DOCUMENTATION
+================================================================================
+
+This document traces every step from the moment a user clicks "Submit" in the
+Streamlit UI all the way to the final decision displayed on screen, with exact
+file paths, method names, and what happens at each stage.
+
+================================================================================
+LAYER OVERVIEW
+================================================================================
+
+  [1] Presentation Layer   → ui/app.py                (Streamlit — port 8501)
+  [2] Microservice Layer   → main.py                  (FastAPI   — port 8000)
+  [3] Orchestration Layer  → orchestrator/graph.py    (LangGraph)
+  [4] Agent Layer          → agents/*.py              (4 Agents + Claude LLM)
+  [5] Communication Layer  → mcp_servers/*.py         (4 FastMCP Servers)
+  [6] Schema Layer         → models/schemas.py        (Pydantic validation)
+
+================================================================================
+STEP-BY-STEP FLOW
+================================================================================
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 1 — USER FILLS FORM AND CLICKS "Submit for AI Analysis"               │
+│  File: ui/app.py  |  Lines: ~150–213                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  - Streamlit renders a form with st.form("loan_application_form")
+  - Fields collected: applicant_id, age, income, employment_type, location,
+    credit_score, loan_amount, loan_tenure_months, existing_liabilities
+  - Live preview metrics are calculated on the fly (DTI, EMI, Loan-to-Income)
+  - When submit_btn is clicked → st.form_submit_button() returns True
+  - Basic client-side validation runs:
+      • applicant_id must not be empty
+      • location must not be empty
+  - A Python dict called `payload` is built with all form values
+  - datetime.utcnow().isoformat() is added as application_timestamp
+  - A user message is appended to st.session_state.chat_history
+
+  KEY METHOD: st.form_submit_button()  →  triggers the block at `if submit_btn:`
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 2 — STREAMLIT CALLS FASTAPI OVER HTTP                                 │
+│  File: ui/app.py  |  Lines: ~245–249                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  - httpx.Client(timeout=300) creates a synchronous HTTP client
+  - Sends POST request:
+      client.post("http://localhost:8000/api/loan/process", json=payload)
+  - The payload is serialized as JSON in the request body
+  - timeout=300 gives up to 5 minutes for the AI agents to finish
+  - A progress bar updates visually while waiting (progress_bar.progress(...))
+
+  KEY METHOD: httpx.Client.post()
+  ENDPOINT CALLED: POST http://localhost:8000/api/loan/process
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 3 — FASTAPI RECEIVES AND VALIDATES THE REQUEST                        │
+│  File: main.py  |  Lines: 66–121                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  - FastAPI route handler: async def process_loan(application: LoanApplication)
+  - Pydantic model LoanApplication (models/schemas.py, Lines: 6–18) auto-
+    validates the incoming JSON:
+      • applicant_id: str (required)
+      • age: int, must be 18–80
+      • income: float, must be > 0
+      • employment_type: one of [salaried, self-employed, contract, unemployed]
+      • credit_score: int, must be 300–850
+      • loan_amount: float, must be > 0
+      • loan_tenure_months: int, must be 6–360
+      • existing_liabilities: float, >= 0
+      • location: str (required)
+  - If validation fails → FastAPI auto-returns HTTP 422 Unprocessable Entity
+  - API key check: if ANTHROPIC_API_KEY is missing → raises HTTP 503
+  - application_timestamp is set to now if not provided
+  - The Pydantic object is converted to a plain dict: application_dict
+  - Calls: await process_loan_application(application_dict)
+
+  KEY METHOD: async def process_loan()  [FastAPI route]
+  PYDANTIC MODEL: LoanApplication  →  models/schemas.py:6
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 4 — LANGGRAPH ORCHESTRATOR INITIALIZES THE WORKFLOW                   │
+│  File: orchestrator/graph.py  |  Lines: 212–243                             │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  - async def process_loan_application(application_data: dict) is called
+  - Calls build_loan_workflow() to construct the LangGraph state machine
+  - build_loan_workflow() (Lines: 166–209):
+      • Creates StateGraph(LoanWorkflowState)
+      • Registers 5 nodes:
+          "applicant_profile"  → applicant_profile_node()
+          "financial_risk"     → financial_risk_node()
+          "loan_decision"      → loan_decision_node()
+          "compliance"         → compliance_node()
+          "compliance_direct"  → compliance_direct_node()  [fast-reject path]
+      • Sets entry point: "applicant_profile"
+      • Adds conditional edge after profile node:
+          should_proceed_after_profile() decides next node:
+            → "financial_risk"     (normal path, no critical errors)
+            → "compliance_direct"  (2+ ERROR flags → immediate rejection)
+      • Linear edges:
+          financial_risk → loan_decision → compliance → END
+          compliance_direct → END
+  - Initial state (LoanWorkflowState TypedDict) is created with all fields None
+  - Workflow is executed: await graph.ainvoke(initial_state)
+
+  KEY METHODS:
+    process_loan_application()   →  orchestrator/graph.py:212
+    build_loan_workflow()        →  orchestrator/graph.py:166
+    graph.ainvoke()              →  LangGraph internal (executes all nodes)
+
+  STATE OBJECT: LoanWorkflowState  →  orchestrator/graph.py:24
+    Fields: application_data, applicant_profile, financial_risk,
+            loan_decision, compliance_result, error, processing_log
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 5 — NODE 1: APPLICANT PROFILE AGENT                                   │
+│  LangGraph node: applicant_profile_node()                                   │
+│  File: orchestrator/graph.py:35  →  calls agents/applicant_profile_agent.py │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  ORCHESTRATOR SIDE (orchestrator/graph.py:35–55):
+    - applicant_profile_node(state) is called by LangGraph
+    - Calls: await run_applicant_profile_agent(state["application_data"])
+    - On success: stores result in state["applicant_profile"]
+    - On error: stores fallback values + logs error
+
+  AGENT SIDE (agents/applicant_profile_agent.py):
+    - async def run_applicant_profile_agent(application_data: dict)
+    - Creates: anthropic.Anthropic(api_key=...) — the Claude SDK client
+    - Opens MCP connection: Client(StdioTransport(command="python3",
+        args=["mcp_servers/applicant_db_server.py"]))
+        • Launches applicant_db_server.py as a subprocess via stdio transport
+        • FastMCP server starts and listens on stdin/stdout
+    - Fetches tool list: await mcp_client.list_tools()
+        • Returns 3 tools: analyze_income_stability, get_credit_history_summary,
+          check_application_completeness
+    - Converts tools to Claude tool_use format (claude_tools list)
+    - Sends message to Claude Sonnet 4.6:
+        client.messages.create(
+            model="global.anthropic.claude-sonnet-4-6",
+            system="You are the Applicant Profile Agent...",
+            tools=claude_tools,
+            messages=[{"role": "user", "content": "Analyze this application..."}]
+        )
+    - Enters agentic tool-use loop (max 10 iterations):
+        LOOP:
+          Claude responds → checks stop_reason:
+            "tool_use" → Claude wants to call a tool
+              • Reads block.name (e.g. "analyze_income_stability")
+              • Reads block.input (e.g. {income: 1500000, employment_type: ...})
+              • Calls: await mcp_client.call_tool(block.name, block.input)
+                  → MCP client sends tool call request to subprocess
+                  → applicant_db_server.py executes the Python function
+                  → Returns JSON result string
+              • Appends tool_result to messages
+              • Calls Claude again with the tool result
+            "end_turn" → Claude is done, parses JSON from final text response
+    - Returns dict with: income_stability_score, employment_risk,
+      credit_history_summary, application_completeness_flags
+
+  MCP SERVER (mcp_servers/applicant_db_server.py):
+    Tool 1: analyze_income_stability(income, employment_type, age)
+      → Calculates base_score from employment type, INR income bands, age group
+      → Returns: income_stability_score (0–100), employment_risk (low/medium/high)
+
+    Tool 2: get_credit_history_summary(credit_score)
+      → Maps credit score to tier: Exceptional/Very Good/Good/Fair/Poor
+      → Returns: tier, summary string
+
+    Tool 3: check_application_completeness(all fields)
+      → Checks for age warnings, income validity, loan ratio flags
+      → Returns: completeness_flags list, is_complete bool
+
+  ROUTING DECISION (orchestrator/graph.py:155–163):
+    should_proceed_after_profile(state):
+      → Counts flags starting with "ERROR"
+      → If >= 2 ERROR flags → route to "compliance_direct" (fast reject)
+      → Otherwise → route to "financial_risk" (normal path)
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 6 — NODE 2: FINANCIAL RISK ANALYSIS AGENT                             │
+│  LangGraph node: financial_risk_node()                                      │
+│  File: orchestrator/graph.py:58  →  calls agents/financial_risk_agent.py   │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  ORCHESTRATOR SIDE (orchestrator/graph.py:58–84):
+    - financial_risk_node(state) is called by LangGraph
+    - Calls: await run_financial_risk_agent(state["application_data"])
+    - On success: stores result in state["financial_risk"]
+    - On error: calculates fallback DTI manually and stores it
+
+  AGENT SIDE (agents/financial_risk_agent.py):
+    - async def run_financial_risk_agent(application_data: dict)
+    - Opens MCP connection to: mcp_servers/risk_rules_server.py (subprocess)
+    - Tool list fetched: 4 tools from RiskRulesDB
+    - Same Claude tool-use loop pattern as Agent 1
+    - Claude calls all 4 tools and then synthesizes a final JSON
+
+  MCP SERVER (mcp_servers/risk_rules_server.py):
+    Tool 1: calculate_debt_to_income_ratio(monthly_income, existing_liabilities,
+                                           proposed_loan_amount, loan_tenure_months)
+      → estimated_monthly_payment = (loan_amount / tenure) * 1.1
+      → dti_ratio = (liabilities + payment) / monthly_income * 100
+      → Classifies: < 20% = low, 20–36% = medium, 36–50% = high, > 50% = very_high
+
+    Tool 2: assess_credit_score_risk(credit_score)
+      → Maps score to risk_level: low (>=700), medium (>=650), high (>=600),
+        very_high (<600)
+      → Returns: risk_level, approval_likelihood, notes
+
+    Tool 3: evaluate_loan_amount_risk(loan_amount, annual_income, credit_score,
+                                      loan_tenure_months)
+      → Calculates loan_to_income_ratio and payment_to_income %
+      → Returns: risk_level (low/medium/high), policy_assessment
+
+    Tool 4: detect_anomalies(applicant_id, age, income, employment_type,
+                             credit_score, loan_amount, existing_liabilities)
+      → Checks: unemployed with income, young with high income, loan > 8x income,
+        poor credit with large loan, liabilities > 70% monthly income
+      → Returns: anomaly_detected (bool), anomaly_details list
+
+  Claude synthesizes all 4 tool results into final JSON:
+    debt_to_income_ratio, credit_score_risk_level, loan_amount_risk,
+    anomaly_detected, anomaly_details, reasoning
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 7 — NODE 3: LOAN DECISION AGENT                                       │
+│  LangGraph node: loan_decision_node()                                       │
+│  File: orchestrator/graph.py:87  →  calls agents/loan_decision_agent.py    │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  ORCHESTRATOR SIDE (orchestrator/graph.py:87–120):
+    - loan_decision_node(state) receives state with applicant_profile +
+      financial_risk already populated
+    - Calls: await run_loan_decision_agent(application_data, applicant_profile,
+                                           financial_risk)
+
+  AGENT SIDE (agents/loan_decision_agent.py):
+    - async def run_loan_decision_agent(application_data, applicant_profile,
+                                        financial_risk)
+    - Opens MCP connection to: mcp_servers/decision_synthesis_server.py
+    - Passes ALL prior analysis as context to Claude in the user message:
+        • Application data (income, credit score, loan amount, etc.)
+        • Applicant profile results (income stability, employment risk, flags)
+        • Financial risk results (DTI, credit risk, anomalies, reasoning)
+    - Claude calls all 3 tools and produces the final classification
+
+  MCP SERVER (mcp_servers/decision_synthesis_server.py):
+    Tool 1: compute_composite_risk_score(income_stability_score, employment_risk,
+            credit_score, dti_ratio, loan_amount_risk, anomaly_detected)
+      → Weighted formula:
+          income_risk        × 0.20  (100 - income_stability_score)
+          employment_risk    × 0.15  (0/15/35 for low/medium/high)
+          credit_risk        × 0.30  (5/15/35/55/80 based on score band)
+          dti_risk           × 0.25  (dti_ratio * 1.5, capped at 100)
+          loan_amount_risk   × 0.10  (0/20/45 for low/medium/high)
+          anomaly_penalty    +20 if anomaly detected
+      → Returns: composite_risk_score (0–100), component_scores breakdown
+
+    Tool 2: classify_loan_decision(composite_risk_score, credit_score,
+            employment_type, dti_ratio, anomaly_detected, application_flags)
+      → Hard rules first:
+          • ERROR flags present    → Rejected (override)
+          • unemployed             → Rejected (override)
+      → Risk-score based:
+          • score < 30 AND credit >= 650 AND dti < 36  → Approved
+          • score >= 70 OR credit < 550                → Rejected
+          • anomaly OR borderline score 30–50          → Manual Review
+          • score 50–70                                → Manual Review
+          • otherwise                                  → Approved
+      → Calculates confidence_level from risk_score
+      → Returns: classification, reason, confidence_level
+
+    Tool 3: extract_key_decision_factors(all risk inputs + composite_risk_score)
+      → Generates up to 5 human-readable factor strings in priority order:
+          credit score assessment, DTI ratio comment, income stability note,
+          employment risk note, loan amount note, anomaly note
+      → Returns: key_factors list (top 5)
+
+  Claude synthesizes final JSON:
+    classification, risk_score, confidence_level, key_decision_factors,
+    explanation (plain-English explanation for the applicant)
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 8 — NODE 4: COMPLIANCE & ACTION ORCHESTRATOR AGENT                    │
+│  LangGraph node: compliance_node()                                          │
+│  File: orchestrator/graph.py:123  →  calls agents/compliance_agent.py      │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  ORCHESTRATOR SIDE (orchestrator/graph.py:123–152):
+    - compliance_node(state) receives state with loan_decision populated
+    - Calls: await run_compliance_agent(application_data, loan_decision)
+
+  AGENT SIDE (agents/compliance_agent.py):
+    - async def run_compliance_agent(application_data, loan_decision)
+    - Opens MCP connection to: mcp_servers/notification_server.py
+    - Claude sees: applicant ID, classification, risk score, key factors
+    - Claude calls tools in order: generate_case_id → send notification →
+      log_compliance_record
+
+  MCP SERVER (mcp_servers/notification_server.py):
+    Tool 1: generate_case_id(applicant_id)
+      → case_id = "LOAN-{APPLICANT_ID}-{YYYYMMDD}-{UUID8}"
+      → Returns: case_id, created_at timestamp
+
+    Tool 2a: send_approval_notification(applicant_id, case_id, loan_amount,
+                                         loan_tenure_months, confidence_level)
+      → Drafts approval letter with EMI calculation
+      → Returns: notification_sent=True, type="approval"
+
+    Tool 2b: send_rejection_notification(applicant_id, case_id, key_reasons)
+      → Drafts rejection letter with top 3 reasons + rights notice
+      → Returns: notification_sent=True, type="rejection"
+
+    Tool 2c: send_manual_review_notification(applicant_id, case_id, review_reasons)
+      → Drafts review-pending letter with review timeline
+      → Returns: notification_sent=True, internal_team_notified=True
+
+    Tool 3: log_compliance_record(case_id, applicant_id, decision, risk_score,
+                                   confidence_level, key_factors, explanation)
+      → Creates audit record with compliance standards:
+          [Fair Lending Act, Equal Credit Opportunity Act, GDPR]
+      → Sets retention_period_years=7
+      → Returns: record_logged=True, audit_record
+
+  Claude synthesizes final JSON:
+    action_taken, notification_sent, case_id, timestamp, summary
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 9 — LANGGRAPH WORKFLOW FINISHES, RETURNS TO FASTAPI                   │
+│  File: orchestrator/graph.py:232–243                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  - graph.ainvoke() returns final_state (LoanWorkflowState) with all fields set
+  - process_loan_application() extracts and returns a clean dict:
+      {
+        "applicant_profile": {...},
+        "financial_risk": {...},
+        "loan_decision": {...},
+        "compliance": {...},
+        "error": None,
+        "processing_log": [...]
+      }
+  - Returns to FastAPI's process_loan() handler
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 10 — FASTAPI BUILDS RESPONSE AND RETURNS TO STREAMLIT                 │
+│  File: main.py  |  Lines: 99–121                                            │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  - process_loan() wraps result into HTTP response dict
+  - Stores result in processing_cache[case_id] for status lookup later
+  - Returns HTTP 200 JSON response:
+      {
+        "success": True,
+        "applicant_id": "...",
+        "applicant_profile": {...},
+        "financial_risk": {...},
+        "loan_decision": {...},
+        "compliance": {...},
+        "processing_log": [...]
+      }
+  - On any exception → HTTP 500 with detail message
+
+
+┌──────────────────────────────────────────────────────────────────────────────┐
+│  STEP 11 — STREAMLIT RECEIVES RESULT AND DISPLAYS IT                        │
+│  File: ui/app.py  |  Lines: ~250–290                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+  - httpx response received: response.status_code == 200
+  - result = response.json() parsed
+  - st.session_state.last_result = result  (persists for Analysis Results tab)
+  - classification extracted from result["loan_decision"]["classification"]
+  - Banner shown based on decision:
+      Approved         → st.success("✅ LOAN APPROVED")
+      Rejected         → st.error("❌ LOAN REJECTED")
+      Manual Review    → st.warning("⚠️ REQUIRES MANUAL REVIEW")
+  - Chat history updated with bot response message
+
+  ANALYSIS RESULTS TAB (ui/app.py:292–405):
+  User clicks tab2 to see detailed breakdown:
+    - Decision badge with color coding (green/red/yellow)
+    - Risk Score, Confidence, Case ID metrics
+    - Agent 1 card: income_stability_score progress bar, employment_risk,
+      credit_history_summary, completeness_flags with color coding
+    - Agent 2 card: DTI ratio with progress bar, credit/loan risk levels,
+      anomaly warning or green check
+    - Agent 3 card: final classification, risk_score progress bar,
+      confidence level, key_decision_factors list, AI explanation text
+    - Agent 4 card: action_taken, notification status, case_id, timestamp,
+      summary
+    - Processing Log expander with all log entries
+    - Raw JSON expander showing full API response
+
+
+================================================================================
+ALTERNATIVE FLOW — CRITICAL ERROR FAST-REJECT PATH
+================================================================================
+
+  Triggered when: applicant_profile returns 2+ flags starting with "ERROR"
+  (e.g., invalid income AND invalid loan amount)
+
+  Node:  applicant_profile_node → should_proceed_after_profile → "compliance_direct"
+  File:  orchestrator/graph.py:155–189
+
+  compliance_direct_node():
+    - Skips financial_risk and loan_decision nodes entirely
+    - Creates a pre-built loan_decision: classification=Rejected, risk_score=95
+    - Calls compliance_node() directly
+    - Goes straight to END
+
+  Result: Application is rejected immediately with audit logging,
+          skipping expensive LLM calls for clearly invalid applications.
+
+
+================================================================================
+DATA MODELS — PYDANTIC SCHEMAS
+================================================================================
+
+  File: models/schemas.py
+
+  LoanApplication (input validation):
+    applicant_id: str
+    age: int (18–80)
+    income: float (> 0, in INR)
+    employment_type: "salaried" | "self-employed" | "contract" | "unemployed"
+    credit_score: int (300–850)
+    loan_amount: float (> 0, in INR)
+    loan_tenure_months: int (6–360)
+    existing_liabilities: float (>= 0, monthly, in INR)
+    location: str
+    application_timestamp: datetime (optional, auto-set)
+
+  ApplicantProfileOutput:
+    income_stability_score: float (0–100)
+    employment_risk: "low" | "medium" | "high"
+    credit_history_summary: str
+    application_completeness_flags: list[str]
+
+  FinancialRiskOutput:
+    debt_to_income_ratio: float
+    credit_score_risk_level: "low" | "medium" | "high" | "very_high"
+    loan_amount_risk: "low" | "medium" | "high"
+    anomaly_detected: bool
+    anomaly_details: str | None
+    reasoning: str
+
+  LoanDecisionOutput:
+    classification: "Approved" | "Rejected" | "Requires Manual Review"
+    risk_score: float (0–100)
+    confidence_level: float (0–1)
+    key_decision_factors: list[str]
+    explanation: str
+
+  ComplianceOutput:
+    action_taken: str
+    notification_sent: bool
+    case_id: str
+    timestamp: str
+    summary: str
+
+
+================================================================================
+KEY METHODS SUMMARY TABLE
+================================================================================
+
+  Method                            File                          Purpose
+  ─────────────────────────────────────────────────────────────────────────────
+  st.form_submit_button()           ui/app.py:213                 Capture submit
+  httpx.Client.post()               ui/app.py:248                 HTTP to FastAPI
+  process_loan()                    main.py:67                    FastAPI handler
+  LoanApplication (Pydantic)        models/schemas.py:6           Input validation
+  process_loan_application()        orchestrator/graph.py:212     Entry to workflow
+  build_loan_workflow()             orchestrator/graph.py:166     Build LangGraph
+  graph.ainvoke()                   orchestrator/graph.py:232     Run all nodes
+  should_proceed_after_profile()    orchestrator/graph.py:155     Routing decision
+  applicant_profile_node()          orchestrator/graph.py:35      Node 1 wrapper
+  financial_risk_node()             orchestrator/graph.py:58      Node 2 wrapper
+  loan_decision_node()              orchestrator/graph.py:87      Node 3 wrapper
+  compliance_node()                 orchestrator/graph.py:123     Node 4 wrapper
+  compliance_direct_node()          orchestrator/graph.py:175     Fast-reject node
+  run_applicant_profile_agent()     agents/applicant_profile_agent.py    Agent 1
+  run_financial_risk_agent()        agents/financial_risk_agent.py       Agent 2
+  run_loan_decision_agent()         agents/loan_decision_agent.py        Agent 3
+  run_compliance_agent()            agents/compliance_agent.py           Agent 4
+  client.messages.create()          all agents                    Call Claude LLM
+  mcp_client.list_tools()           all agents                    Get MCP tools
+  mcp_client.call_tool()            all agents                    Execute MCP tool
+  analyze_income_stability()        mcp_servers/applicant_db_server.py   Tool
+  get_credit_history_summary()      mcp_servers/applicant_db_server.py   Tool
+  check_application_completeness()  mcp_servers/applicant_db_server.py   Tool
+  calculate_debt_to_income_ratio()  mcp_servers/risk_rules_server.py     Tool
+  assess_credit_score_risk()        mcp_servers/risk_rules_server.py     Tool
+  evaluate_loan_amount_risk()       mcp_servers/risk_rules_server.py     Tool
+  detect_anomalies()                mcp_servers/risk_rules_server.py     Tool
+  compute_composite_risk_score()    mcp_servers/decision_synthesis_server.py Tool
+  classify_loan_decision()          mcp_servers/decision_synthesis_server.py Tool
+  extract_key_decision_factors()    mcp_servers/decision_synthesis_server.py Tool
+  generate_case_id()                mcp_servers/notification_server.py   Tool
+  send_approval_notification()      mcp_servers/notification_server.py   Tool
+  send_rejection_notification()     mcp_servers/notification_server.py   Tool
+  send_manual_review_notification() mcp_servers/notification_server.py   Tool
+  log_compliance_record()           mcp_servers/notification_server.py   Tool
+
+
+================================================================================
+TECHNOLOGY USED AT EACH LAYER
+================================================================================
+
+  Streamlit (ui/app.py)
+    → st.form, st.number_input, st.selectbox, st.slider, st.progress,
+      st.success/error/warning, st.session_state, st.tabs, st.columns
+
+  httpx (ui/app.py)
+    → httpx.Client, httpx.get (health check)
+
+  FastAPI (main.py)
+    → @app.post, @app.get, HTTPException, CORSMiddleware, Pydantic auto-parse
+
+  Pydantic (models/schemas.py)
+    → BaseModel, Field, Literal, Optional — request/response validation
+
+  LangGraph (orchestrator/graph.py)
+    → StateGraph, TypedDict, Annotated, operator.add, add_node, add_edge,
+      add_conditional_edges, set_entry_point, compile(), ainvoke()
+
+  Anthropic SDK (all agents)
+    → anthropic.Anthropic(), client.messages.create(), tool_use loop,
+      stop_reason handling, content block parsing
+
+  FastMCP (all agents + mcp_servers)
+    → FastMCP("ServerName"), @mcp.tool(), mcp.run(transport="stdio")
+      Client, StdioTransport, list_tools(), call_tool()
+
+  python-dotenv (.env / all files)
+    → load_dotenv(), os.getenv("ANTHROPIC_API_KEY")
+
+  uvicorn (start.sh / main.py)
+    → uvicorn main:app --host 0.0.0.0 --port 8000
+
+
+================================================================================
+END OF FLOW DOCUMENT
+================================================================================

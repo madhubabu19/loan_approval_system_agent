@@ -1,0 +1,1 @@
+Using the comprehensive review criteria in /GEN AI CASE STUDY LOAN APPROVAL SYSTEM EVALUATOR PROMPT.md thoroughly evaluate the code submission in in current folder for participant "Participant Name <Vayalapalli><Madhubabu>. Generate all required summary reports and save it in a file with detailed scoring and recommendations.
